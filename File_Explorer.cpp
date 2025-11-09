@@ -1,17 +1,19 @@
+// file_explorer.cpp
+// Advanced Linux File Explorer - requires C++17
 #include <iostream>
 #include <string>
 #include <vector>
-#include <dirent.h>
-#include <sys/stat.h>
-#include <unistd.h>
-#include <cstring>
-#include <algorithm>
+#include <filesystem>
 #include <fstream>
+#include <iomanip>
+#include <algorithm>
+#include <sys/stat.h>
 #include <pwd.h>
 #include <grp.h>
-#include <time.h>
-#include <iomanip>
+#include <unistd.h>
+#include <sstream>
 
+namespace fs = std::filesystem;
 using namespace std;
 
 #define RESET   "\033[0m"
@@ -23,357 +25,357 @@ using namespace std;
 #define WHITE   "\033[37m"
 #define BOLD    "\033[1m"
 
+static string human_size(uintmax_t size) {
+    const char* units[] = {"B","KB","MB","GB","TB"};
+    double s = (double)size;
+    int i = 0;
+    while (s >= 1024.0 && i < 4) { s /= 1024.0; ++i; }
+    ostringstream oss;
+    oss << fixed << setprecision(2) << s << " " << units[i];
+    return oss.str();
+}
+
+static string permission_string(const fs::perms p) {
+    string s;
+    s += (fs::is_directory(p) ? 'd' : '-'); // placeholder; we'll calculate below
+    s.clear();
+    s += ( (p & fs::perms::owner_read)  != fs::perms::none ) ? 'r' : '-';
+    s += ( (p & fs::perms::owner_write) != fs::perms::none ) ? 'w' : '-';
+    s += ( (p & fs::perms::owner_exec)  != fs::perms::none ) ? 'x' : '-';
+    s += ( (p & fs::perms::group_read)  != fs::perms::none ) ? 'r' : '-';
+    s += ( (p & fs::perms::group_write) != fs::perms::none ) ? 'w' : '-';
+    s += ( (p & fs::perms::group_exec)  != fs::perms::none ) ? 'x' : '-';
+    s += ( (p & fs::perms::others_read)  != fs::perms::none ) ? 'r' : '-';
+    s += ( (p & fs::perms::others_write) != fs::perms::none ) ? 'w' : '-';
+    s += ( (p & fs::perms::others_exec)  != fs::perms::none ) ? 'x' : '-';
+    return s;
+}
+
+static string octal_permissions(const fs::perms p) {
+    int owner = ((p & fs::perms::owner_read)  != fs::perms::none) << 2 |
+                ((p & fs::perms::owner_write) != fs::perms::none) << 1 |
+                ((p & fs::perms::owner_exec)  != fs::perms::none);
+    int group = ((p & fs::perms::group_read)  != fs::perms::none) << 2 |
+                ((p & fs::perms::group_write) != fs::perms::none) << 1 |
+                ((p & fs::perms::group_exec)  != fs::perms::none);
+    int others= ((p & fs::perms::others_read)  != fs::perms::none) << 2 |
+                ((p & fs::perms::others_write) != fs::perms::none) << 1 |
+                ((p & fs::perms::others_exec)  != fs::perms::none);
+    ostringstream oss;
+    oss << owner << group << others;
+    return oss.str();
+}
+
+struct Entry {
+    fs::path path;
+    bool is_dir;
+    uintmax_t size;
+    std::filesystem::file_time_type mtime;
+};
+
+enum SortBy { NAME, SIZE, MTIME };
+
 class FileExplorer {
 private:
-    string currentPath;
-
-    string getPermissionsString(mode_t mode) {
-        string perms = "";
-        perms += (S_ISDIR(mode)) ? "d" : "-";
-        perms += (mode & S_IRUSR) ? "r" : "-";
-        perms += (mode & S_IWUSR) ? "w" : "-";
-        perms += (mode & S_IXUSR) ? "x" : "-";
-        perms += (mode & S_IRGRP) ? "r" : "-";
-        perms += (mode & S_IWGRP) ? "w" : "-";
-        perms += (mode & S_IXGRP) ? "x" : "-";
-        perms += (mode & S_IROTH) ? "r" : "-";
-        perms += (mode & S_IWOTH) ? "w" : "-";
-        perms += (mode & S_IXOTH) ? "x" : "-";
-        return perms;
-    }
-
-    string formatFileSize(off_t size) {
-        const char* units[] = {"B", "KB", "MB", "GB"};
-        double fsize = size;
-        int i = 0;
-        while (fsize >= 1024 && i < 3) {
-            fsize /= 1024;
-            i++;
-        }
-        char buffer[50];
-        snprintf(buffer, sizeof(buffer), "%.2f %s", fsize, units[i]);
-        return string(buffer);
-    }
-
-    string getModificationTime(time_t mtime) {
-        char buffer[100];
-        struct tm* timeinfo = localtime(&mtime);
-        strftime(buffer, sizeof(buffer), "%Y-%m-%d %H:%M:%S", timeinfo);
-        return string(buffer);
-    }
+    fs::path current;
+    bool showHidden = false;
+    SortBy sortBy = NAME;
+    bool dirsFirst = true;
 
 public:
     FileExplorer() {
-        char cwd[1024];
-        getcwd(cwd, sizeof(cwd));
-        currentPath = string(cwd);
+        current = fs::current_path();
     }
 
-    string getCurrentPath() const { return currentPath; }
+    string getCurrentPath() const { return current.string(); }
 
-    void listFiles(bool detailed = false) {
-        DIR* dir = opendir(currentPath.c_str());
-        if (!dir) {
-            cout << RED << "Error: Cannot open directory." << RESET << endl;
-            return;
+    void toggleHidden() { showHidden = !showHidden; cout << YELLOW << "Show hidden: " << (showHidden ? "ON" : "OFF") << RESET << endl; }
+
+    void setSort(SortBy s, bool df) { sortBy = s; dirsFirst = df; }
+
+    vector<Entry> readDirectory(const fs::path &p) {
+        vector<Entry> res;
+        error_code ec;
+        if (!fs::exists(p, ec)) {
+            cout << RED << "Path does not exist: " << p << RESET << endl;
+            return res;
         }
-
-        struct dirent* entry;
-        vector<pair<string, bool>> entries;
-        while ((entry = readdir(dir)) != NULL) {
-            string name = entry->d_name;
-            string fullPath = currentPath + "/" + name;
-            struct stat fileStat;
-            stat(fullPath.c_str(), &fileStat);
-            entries.push_back({name, S_ISDIR(fileStat.st_mode)});
+        for (auto &it : fs::directory_iterator(p, fs::directory_options::skip_permission_denied, ec)) {
+            string name = it.path().filename().string();
+            if (!showHidden && !name.empty() && name[0]=='.') continue;
+            Entry e;
+            e.path = it.path();
+            e.is_dir = it.is_directory(ec);
+            e.size = e.is_dir ? 0 : (uintmax_t)fs::file_size(it.path(), ec);
+            e.mtime = fs::last_write_time(it.path(), ec);
+            res.push_back(move(e));
         }
-        closedir(dir);
+        sortEntries(res);
+        return res;
+    }
 
-        sort(entries.begin(), entries.end(), [](auto &a, auto &b) {
-            if (a.second != b.second) return a.second > b.second;
-            return a.first < b.first;
+    void sortEntries(vector<Entry>& entries) {
+        sort(entries.begin(), entries.end(), [&](const Entry &a, const Entry &b){
+            if (dirsFirst && a.is_dir != b.is_dir) return a.is_dir > b.is_dir;
+            if (sortBy == NAME) return a.path.filename().string() < b.path.filename().string();
+            if (sortBy == SIZE) return a.size < b.size;
+            if (sortBy == MTIME) return a.mtime < b.mtime;
+            return a.path.filename().string() < b.path.filename().string();
         });
+    }
 
-        cout << "\n" << BOLD << CYAN << "Current Directory: " << currentPath << RESET << endl;
-        cout << string(80, '=') << endl;
-
+    void list(bool detailed=false) {
+        cout << "\n" << BOLD << CYAN << "Current Directory: " << current << RESET << endl;
+        auto entries = readDirectory(current);
         if (detailed) {
-            cout << left << setw(12) << "Permissions" << setw(10) << "Owner"
-                 << setw(10) << "Group" << setw(12) << "Size"
-                 << setw(20) << "Modified" << "Name" << endl;
-            cout << string(80, '-') << endl;
+            cout << left << setw(12) << "Perms" << setw(8) << "Oct" << setw(12) << "Owner"
+                 << setw(12) << "Group" << setw(12) << "Size" << setw(20) << "Modified" << "Name" << endl;
+            cout << string(100, '-') << endl;
         }
-
-        for (auto &entry : entries) {
-            string name = entry.first;
-            string fullPath = currentPath + "/" + name;
-            struct stat fileStat;
-            stat(fullPath.c_str(), &fileStat);
-
-            if (detailed) {
-                struct passwd* pw = getpwuid(fileStat.st_uid);
-                struct group* gr = getgrgid(fileStat.st_gid);
-                cout << left << setw(12) << getPermissionsString(fileStat.st_mode)
-                     << setw(10) << (pw ? pw->pw_name : to_string(fileStat.st_uid))
-                     << setw(10) << (gr ? gr->gr_name : to_string(fileStat.st_gid))
-                     << setw(12) << formatFileSize(fileStat.st_size)
-                     << setw(20) << getModificationTime(fileStat.st_mtime);
+        for (auto &e : entries) {
+            string name = e.path.filename().string();
+            error_code ec;
+            fs::perms p = fs::status(e.path, ec).permissions();
+            // owner/group via stat
+            struct stat st;
+            string owner = "-", group = "-";
+            if (stat(e.path.c_str(), &st) == 0) {
+                struct passwd *pw = getpwuid(st.st_uid);
+                struct group  *gr = getgrgid(st.st_gid);
+                owner = pw ? pw->pw_name : to_string(st.st_uid);
+                group = gr ? gr->gr_name : to_string(st.st_gid);
             }
-
-            if (S_ISDIR(fileStat.st_mode))
-                cout << BLUE << name << "/" << RESET << endl;
-            else if (fileStat.st_mode & S_IXUSR)
-                cout << GREEN << name << "*" << RESET << endl;
-            else
-                cout << WHITE << name << RESET << endl;
+            if (detailed) {
+                // permission string
+                string perms = permission_string(p);
+                string oct = octal_permissions(p);
+                // mtime to readable
+                auto ftime = fs::last_write_time(e.path, ec);
+                std::time_t cftime = decltype(ftime)::clock::to_time_t(ftime);
+                char buf[64];
+                strftime(buf, sizeof(buf), "%Y-%m-%d %H:%M:%S", localtime(&cftime));
+                cout << left << setw(12) << perms << setw(8) << oct
+                     << setw(12) << owner << setw(12) << group
+                     << setw(12) << (e.is_dir ? "-" : human_size(e.size))
+                     << setw(20) << buf;
+            }
+            if (e.is_dir) cout << BLUE << name << "/" << RESET << endl;
+            else if ((p & fs::perms::owner_exec) != fs::perms::none) cout << GREEN << name << "*" << RESET << endl;
+            else cout << WHITE << name << RESET << endl;
         }
     }
 
-    void changeDirectory(const string &path) {
-        string newPath;
-        if (path == "..") {
-            size_t pos = currentPath.find_last_of('/');
-            newPath = (pos == 0) ? "/" : currentPath.substr(0, pos);
-        } else newPath = currentPath + "/" + path;
-
-        if (chdir(newPath.c_str()) == 0) {
-            currentPath = newPath;
-            cout << GREEN << "Changed directory to: " << currentPath << RESET << endl;
-        } else cout << RED << "Error: Directory not found." << RESET << endl;
-    }
-
-    void createFile(const string &filename) {
-        ofstream file(currentPath + "/" + filename);
-        if (file.is_open()) {
-            file.close();
-            cout << GREEN << "File created: " << filename << RESET << endl;
-        } else cout << RED << "Error creating file." << RESET << endl;
-    }
-
-    void createDirectory(const string &dirname) {
-        if (mkdir((currentPath + "/" + dirname).c_str(), 0755) == 0)
-            cout << GREEN << "Directory created: " << dirname << RESET << endl;
-        else cout << RED << "Error creating directory." << RESET << endl;
-    }
-
-    void deleteItem(const string &name) {
-        string path = currentPath + "/" + name;
-        struct stat s;
-        if (stat(path.c_str(), &s) != 0) {
-            cout << RED << "Item not found." << RESET << endl;
-            return;
+    bool changeDirectory(const string &target) {
+        fs::path newp = target.empty() ? fs::path(getenv("HOME")) : fs::path(target);
+        if (!newp.is_absolute()) newp = current / newp;
+        error_code ec;
+        newp = fs::weakly_canonical(newp, ec);
+        if (ec) {
+            cout << RED << "Invalid path: " << target << RESET << endl;
+            return false;
         }
-        if (S_ISDIR(s.st_mode)) {
-            if (rmdir(path.c_str()) == 0)
-                cout << GREEN << "Directory deleted." << RESET << endl;
-            else cout << RED << "Error deleting directory." << RESET << endl;
+        if (!fs::is_directory(newp, ec)) {
+            cout << RED << "Not a directory: " << newp << RESET << endl;
+            return false;
+        }
+        current = newp;
+        cout << GREEN << "Changed directory to: " << current << RESET << endl;
+        return true;
+    }
+
+    bool makeDirectory(const string &name) {
+        fs::path p = (fs::path(name).is_absolute() ? fs::path(name) : current / name);
+        error_code ec;
+        if (fs::create_directories(p, ec)) {
+            cout << GREEN << "Directory created: " << p << RESET << endl; return true;
+        }
+        cout << RED << "Failed to create directory: " << p << " (" << ec.message() << ")" << RESET << endl;
+        return false;
+    }
+
+    bool createFile(const string &name) {
+        fs::path p = (fs::path(name).is_absolute() ? fs::path(name) : current / name);
+        error_code ec;
+        ofstream ofs(p);
+        if (!ofs) { cout << RED << "Failed to create file: " << p << RESET << endl; return false; }
+        ofs.close();
+        cout << GREEN << "File created: " << p << RESET << endl; return true;
+    }
+
+    bool previewFile(const string &name, size_t max_lines=20) {
+        fs::path p = (fs::path(name).is_absolute() ? fs::path(name) : current / name);
+        error_code ec;
+        if (!fs::exists(p, ec) || fs::is_directory(p, ec)) { cout << RED << "No such file or it's a directory." << RESET << endl; return false; }
+        ifstream ifs(p);
+        string line;
+        size_t cnt = 0;
+        cout << BOLD << CYAN << "----- Preview: " << p << " -----" << RESET << endl;
+        while (cnt < max_lines && getline(ifs, line)) {
+            cout << line << endl; ++cnt;
+        }
+        if (!ifs.eof()) cout << YELLOW << "...(truncated)..." << RESET << endl;
+        return true;
+    }
+
+    bool removeRecursively(const string &name) {
+        fs::path p = (fs::path(name).is_absolute() ? fs::path(name) : current / name);
+        error_code ec;
+        if (!fs::exists(p, ec)) { cout << RED << "Not found: " << p << RESET << endl; return false; }
+        cout << YELLOW << "Are you sure you want to delete '" << p << "' recursively? (y/N): " << RESET;
+        string ans; getline(cin, ans);
+        if (ans != "y" && ans != "Y") { cout << "Aborted." << endl; return false; }
+        fs::remove_all(p, ec);
+        if (ec) { cout << RED << "Failed to delete: " << ec.message() << RESET << endl; return false; }
+        cout << GREEN << "Deleted: " << p << RESET << endl;
+        return true;
+    }
+
+    bool copyRecursively(const string &src, const string &dst) {
+        fs::path s = (fs::path(src).is_absolute() ? fs::path(src) : current / src);
+        fs::path d = (fs::path(dst).is_absolute() ? fs::path(dst) : current / dst);
+        error_code ec;
+        if (!fs::exists(s, ec)) { cout << RED << "Source not found: " << s << RESET << endl; return false; }
+        if (fs::is_directory(s, ec)) {
+            // replicate directory tree
+            for (auto &it : fs::recursive_directory_iterator(s, ec)) {
+                fs::path rel = fs::relative(it.path(), s, ec);
+                fs::path target = d / rel;
+                if (fs::is_directory(it.path(), ec)) fs::create_directories(target, ec);
+                else {
+                    fs::create_directories(target.parent_path(), ec);
+                    fs::copy_file(it.path(), target, fs::copy_options::overwrite_existing, ec);
+                    if (ec) cout << RED << "Failed copy: " << it.path() << " -> " << target << " : " << ec.message() << RESET << endl;
+                }
+            }
         } else {
-            if (unlink(path.c_str()) == 0)
-                cout << GREEN << "File deleted." << RESET << endl;
-            else cout << RED << "Error deleting file." << RESET << endl;
+            fs::create_directories(d.parent_path(), ec);
+            fs::copy_file(s, d, fs::copy_options::overwrite_existing, ec);
+            if (ec) { cout << RED << "Failed: " << ec.message() << RESET << endl; return false; }
+        }
+        cout << GREEN << "Copy complete." << RESET << endl;
+        return true;
+    }
+
+    void searchRecursive(const string &term) {
+        cout << CYAN << "Searching recursively for: " << term << " in " << current << RESET << endl;
+        error_code ec;
+        size_t found=0;
+        for (auto &it : fs::recursive_directory_iterator(current, fs::directory_options::skip_permission_denied, ec)) {
+            string name = it.path().filename().string();
+            if (name.find(term) != string::npos) {
+                cout << (it.is_directory()? BLUE : WHITE) << it.path().string() << RESET << endl;
+                ++found;
+            }
+        }
+        cout << YELLOW << "Found: " << found << " item(s)." << RESET << endl;
+    }
+
+    bool changePermissions(const string &target, const string &mode_str) {
+        fs::path p = (fs::path(target).is_absolute() ? fs::path(target) : current / target);
+        error_code ec;
+        if (!fs::exists(p, ec)) { cout << RED << "Not found: " << p << RESET << endl; return false; }
+        // parse octal: e.g., 755
+        try {
+            int m = stoi(mode_str, nullptr, 8);
+            mode_t mode = (mode_t)m;
+            if (chmod(p.c_str(), mode) != 0) {
+                cout << RED << "chmod failed (require permissions or sudo)." << RESET << endl; return false;
+            }
+            cout << GREEN << "Permissions changed." << RESET << endl;
+            return true;
+        } catch (...) {
+            cout << RED << "Invalid mode: " << mode_str << RESET << endl;
+            return false;
         }
     }
 
-    void copyFile(const string &src, const string &dest) {
-        ifstream in(currentPath + "/" + src, ios::binary);
-        ofstream out(currentPath + "/" + dest, ios::binary);
-        if (!in || !out) {
-            cout << RED << "Error copying file." << RESET << endl;
-            return;
-        }
-        out << in.rdbuf();
-        cout << GREEN << "File copied from " << src << " to " << dest << RESET << endl;
+    bool renameItem(const string &oldn, const string &newn) {
+        fs::path a = (fs::path(oldn).is_absolute() ? fs::path(oldn) : current / oldn);
+        fs::path b = (fs::path(newn).is_absolute() ? fs::path(newn) : current / newn);
+        error_code ec;
+        fs::rename(a, b, ec);
+        if (ec) { cout << RED << "Rename failed: " << ec.message() << RESET << endl; return false; }
+        cout << GREEN << "Renamed." << RESET << endl; return true;
     }
 
-    void moveFile(const string &src, const string &dest) {
-        string srcPath = currentPath + "/" + src;
-        string destPath = currentPath + "/" + dest;
-        if (rename(srcPath.c_str(), destPath.c_str()) == 0)
-            cout << GREEN << "File moved successfully." << RESET << endl;
-        else
-            cout << RED << "Error moving file." << RESET << endl;
-    }
-
-    void renameItem(const string &oldName, const string &newName) {
-        string oldPath = currentPath + "/" + oldName;
-        string newPath = currentPath + "/" + newName;
-        if (rename(oldPath.c_str(), newPath.c_str()) == 0)
-            cout << GREEN << "Item renamed successfully." << RESET << endl;
-        else
-            cout << RED << "Error renaming item." << RESET << endl;
-    }
-
-    void searchFiles(const string &term) {
-        DIR* dir = opendir(currentPath.c_str());
-        if (!dir) return;
-        struct dirent* entry;
-        cout << "\nSearch results for \"" << term << "\":" << endl;
-        cout << string(50, '-') << endl;
-        while ((entry = readdir(dir)) != NULL) {
-            string name = entry->d_name;
-            if (name.find(term) != string::npos)
-                cout << name << endl;
-        }
-        closedir(dir);
-    }
-
-    void viewPermissions(const string &filename) {
-        string fullPath = currentPath + "/" + filename;
-        struct stat fileStat;
-        if (stat(fullPath.c_str(), &fileStat) != 0) {
-            cout << RED << "File not found." << RESET << endl;
-            return;
-        }
-        cout << "Permissions: " << getPermissionsString(fileStat.st_mode) << endl;
-        cout << "Owner: " << getpwuid(fileStat.st_uid)->pw_name << endl;
-        cout << "Group: " << getgrgid(fileStat.st_gid)->gr_name << endl;
-        cout << "Size: " << formatFileSize(fileStat.st_size) << endl;
-        cout << "Last Modified: " << getModificationTime(fileStat.st_mtime) << endl;
-    }
-
-    void changePermissions(const string &filename, const string &modeStr) {
-        mode_t mode = stoi(modeStr, nullptr, 8);
-        if (chmod((currentPath + "/" + filename).c_str(), mode) == 0)
-            cout << GREEN << "Permissions changed successfully." << RESET << endl;
-        else
-            cout << RED << "Error changing permissions." << RESET << endl;
-    }
-
-    void changeOwner(const string &filename, const string &user, const string &group) {
-        struct passwd *pw = getpwnam(user.c_str());
-        struct group *gr = getgrnam(group.c_str());
-        if (!pw || !gr) {
-            cout << RED << "Invalid user or group." << RESET << endl;
-            return;
-        }
-        if (chown((currentPath + "/" + filename).c_str(), pw->pw_uid, gr->gr_gid) == 0)
-            cout << GREEN << "Owner/Group changed successfully." << RESET << endl;
-        else
-            cout << RED << "Error changing owner/group (may require sudo)." << RESET << endl;
+    bool moveItem(const string &src, const string &dst) {
+        fs::path s = (fs::path(src).is_absolute() ? fs::path(src) : current / src);
+        fs::path d = (fs::path(dst).is_absolute() ? fs::path(dst) : current / dst);
+        error_code ec;
+        fs::create_directories(d.parent_path(), ec);
+        fs::rename(s, d, ec);
+        if (ec) { cout << RED << "Move/rename failed: " << ec.message() << RESET << endl; return false; }
+        cout << GREEN << "Moved." << RESET << endl; return true;
     }
 };
 
-void displayMenu(const string &path) {
-    cout << "\n" << BOLD << CYAN << "==================== FILE EXPLORER MENU ====================" << RESET << endl;
-    cout << BOLD << "Current Directory: " << RESET << path << endl;
-    cout << string(60, '-') << endl;
-    cout << "1.  List files (simple)\n";
-    cout << "2.  List files (detailed)\n";
-    cout << "3.  Change directory\n";
-    cout << "4.  Go to parent directory\n";
-    cout << "5.  Create file\n";
-    cout << "6.  Create directory\n";
-    cout << "7.  Delete file/directory\n";
-    cout << "8.  Copy file\n";
-    cout << "9.  Move file\n";
-    cout << "10. Rename file/directory\n";
-    cout << "11. Search files\n";
-    cout << "12. View file permissions\n";
-    cout << "13. Change permissions (chmod)\n";
-    cout << "14. Change owner/group (chown)\n";
-    cout << "15. Display current path\n";
-    cout << "0.  Exit\n";
-    cout << string(60, '-') << endl;
+void showMenu(const string &cwd) {
+    cout << "\n" << BOLD << CYAN << "========= Advanced File Explorer =========" << RESET << endl;
+    cout << "Current: " << cwd << endl;
+    cout << "1. List (simple)\n2. List (detailed)\n3. Change directory\n4. Toggle hidden files\n5. Create file\n6. Create directory\n7. Delete (recursive)\n8. Copy (recursive)\n9. Move\n10. Rename\n11. Preview file\n12. Search recursively\n13. Change permissions (chmod)\n14. Set sort (name/size/mtime)\n15. Exit\n";
 }
 
 int main() {
+    ios::sync_with_stdio(false);
+    cin.tie(nullptr);
     FileExplorer explorer;
-    int choice;
-    string input1, input2, input3;
-
-    cout << "\n" << string(60, '=') << endl;
-    cout << BOLD << CYAN << "              FILE EXPLORER APPLICATION" << RESET << endl;
-    cout << BOLD << GREEN << "       Linux File Management System (C++)" << RESET << endl;
-    cout << string(60, '=') << endl;
-
     while (true) {
-        displayMenu(explorer.getCurrentPath());
-        cout << "Enter your choice: ";
-        cin >> choice;
-        cin.ignore();
+        showMenu(explorer.getCurrentPath());
+        cout << "Enter choice: ";
+        string choice;
+        if (!getline(cin, choice)) break;
+        if (choice.empty()) continue;
 
-        switch (choice) {
-            case 1: explorer.listFiles(false); break;
-            case 2: explorer.listFiles(true); break;
-            case 3:
-                cout << "Enter directory name: ";
-                getline(cin, input1);
-                explorer.changeDirectory(input1);
-                break;
-            case 4: explorer.changeDirectory(".."); break;
-            case 5:
-                cout << "Enter filename: ";
-                getline(cin, input1);
-                explorer.createFile(input1);
-                break;
-            case 6:
-                cout << "Enter directory name: ";
-                getline(cin, input1);
-                explorer.createDirectory(input1);
-                break;
-            case 7:
-                cout << "Enter item to delete: ";
-                getline(cin, input1);
-                explorer.deleteItem(input1);
-                break;
-            case 8:
-                cout << "Enter source filename: ";
-                getline(cin, input1);
-                cout << "Enter destination filename: ";
-                getline(cin, input2);
-                explorer.copyFile(input1, input2);
-                break;
-            case 9:
-                cout << "Enter source filename: ";
-                getline(cin, input1);
-                cout << "Enter destination filename: ";
-                getline(cin, input2);
-                explorer.moveFile(input1, input2);
-                break;
-            case 10:
-                cout << "Enter current name: ";
-                getline(cin, input1);
-                cout << "Enter new name: ";
-                getline(cin, input2);
-                explorer.renameItem(input1, input2);
-                break;
-            case 11:
-                cout << "Enter search term: ";
-                getline(cin, input1);
-                explorer.searchFiles(input1);
-                break;
-            case 12:
-                cout << "Enter filename: ";
-                getline(cin, input1);
-                explorer.viewPermissions(input1);
-                break;
-            case 13:
-                cout << "Enter filename: ";
-                getline(cin, input1);
-                cout << "Enter permission (e.g., 755): ";
-                getline(cin, input2);
-                explorer.changePermissions(input1, input2);
-                break;
-            case 14:
-                cout << "Enter filename: ";
-                getline(cin, input1);
-                cout << "Enter owner username: ";
-                getline(cin, input2);
-                cout << "Enter group name: ";
-                getline(cin, input3);
-                explorer.changeOwner(input1, input2, input3);
-                break;
-            case 15:
-                cout << CYAN << "Current path: " << explorer.getCurrentPath() << RESET << endl;
-                break;
-            case 0:
-                cout << GREEN << "Exiting File Explorer. Goodbye!" << RESET << endl;
-                return 0;
-            default:
-                cout << RED << "Invalid choice!" << RESET << endl;
+        if (choice == "1") explorer.list(false);
+        else if (choice == "2") explorer.list(true);
+        else if (choice == "3") {
+            cout << "Enter path (abs or relative, blank => HOME): ";
+            string p; getline(cin, p);
+            explorer.changeDirectory(p);
+        } else if (choice == "4") explorer.toggleHidden();
+        else if (choice == "5") {
+            cout << "Filename: "; string f; getline(cin,f); explorer.createFile(f);
+        } else if (choice == "6") {
+            cout << "Directory name: "; string d; getline(cin,d); explorer.makeDirectory(d);
+        } else if (choice == "7") {
+            cout << "Item to delete (path): "; string t; getline(cin,t); explorer.removeRecursively(t);
+        } else if (choice == "8") {
+            cout << "Source: "; string s; getline(cin,s);
+            cout << "Destination: "; string d; getline(cin,d);
+            explorer.copyRecursively(s,d);
+        } else if (choice == "9") {
+            cout << "Source: "; string s; getline(cin,s);
+            cout << "Destination: "; string d; getline(cin,d);
+            explorer.moveItem(s,d);
+        } else if (choice == "10") {
+            cout << "Current name: "; string a; getline(cin,a);
+            cout << "New name: "; string b; getline(cin,b);
+            explorer.renameItem(a,b);
+        } else if (choice == "11") {
+            cout << "File to preview: "; string f; getline(cin,f);
+            explorer.previewFile(f, 30);
+        } else if (choice == "12") {
+            cout << "Search term: "; string t; getline(cin,t);
+            explorer.searchRecursive(t);
+        } else if (choice == "13") {
+            cout << "Target file: "; string tf; getline(cin,tf);
+            cout << "Mode (octal e.g. 755): "; string m; getline(cin,m);
+            explorer.changePermissions(tf, m);
+        } else if (choice == "14") {
+            cout << "Sort by (name/size/mtime): "; string s; getline(cin,s);
+            bool df=true;
+            cout << "Directories first? (y/N): "; string q; getline(cin,q);
+            if (q=="y"||q=="Y") df=true; else df=false;
+            if (s=="name") explorer.setSort(NAME, df);
+            else if (s=="size") explorer.setSort(SIZE, df);
+            else if (s=="mtime") explorer.setSort(MTIME, df);
+            else cout << RED << "Unknown sort option" << RESET << endl;
+        } else if (choice == "15") {
+            cout << GREEN << "Goodbye!" << RESET << endl; break;
+        } else {
+            cout << RED << "Invalid option" << RESET << endl;
         }
-
-        cout << "\nPress Enter to continue...";
-        cin.get();
+        cout << "\nPress Enter to continue..."; string dummy; getline(cin, dummy);
     }
+    return 0;
 }
