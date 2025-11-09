@@ -1,38 +1,34 @@
-# Compiler and flags
+# Makefile - Advanced File Explorer
 CXX = g++
 CXXFLAGS = -Wall -Wextra -std=c++17 -O2
-
-# Target executable
+LDFLAGS = 
 TARGET = file_explorer
-
-# Source file
 SRC = file_explorer.cpp
 
 all: $(TARGET)
 
 $(TARGET): $(SRC)
-	@echo "Compiling the File Explorer program..."
-	$(CXX) $(CXXFLAGS) $(SRC) -o $(TARGET)
-	@echo "Build complete. Run './$(TARGET)' to start the program."
+	@echo "Compiling Advanced File Explorer..."
+	$(CXX) $(CXXFLAGS) $(SRC) -o $(TARGET) $(LDFLAGS)
+	@echo "Build complete."
 
 run: all
-	@echo "Running File Explorer..."
+	@echo "Running..."
 	./$(TARGET)
 
 install: $(TARGET)
-	@echo "Installing File Explorer to /usr/local/bin..."
+	@echo "Installing to /usr/local/bin (sudo may be required)..."
 	sudo cp $(TARGET) /usr/local/bin/
-	@echo "Installation complete. You can now run it using 'file_explorer'."
+	@echo "Installed: /usr/local/bin/$(TARGET)"
 
 uninstall:
-	@echo "Removing File Explorer from /usr/local/bin..."
+	@echo "Removing /usr/local/bin/$(TARGET)..."
 	sudo rm -f /usr/local/bin/$(TARGET)
-	@echo "Uninstallation complete."
+	@echo "Removed."
 
 clean:
-	@echo "Cleaning up build files..."
+	@echo "Cleaning build..."
 	rm -f $(TARGET)
-	@echo "Clean complete."
-
+	@echo "Clean done."
 
 .PHONY: all run install uninstall clean
